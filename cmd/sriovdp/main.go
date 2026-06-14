@@ -16,11 +16,14 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
 
 	"github.com/golang/glog"
+
+	"github.com/k8snetworkplumbingwg/sriov-network-device-plugin/pkg/logging"
 )
 
 const (
@@ -35,12 +38,30 @@ func flagInit(cp *cliParams) {
 		"resource name prefix used for K8s extended resource")
 	flag.BoolVar(&cp.useCdi, "use-cdi", false,
 		"Use Container Device Interface to expose devices in containers")
+	flag.IntVar(&cp.logMaxSize, "log-max-size", 100,
+		"Maximum size in MB of a log file before rotation")
+	flag.IntVar(&cp.logMaxFiles, "log-max-files", 5,
+		"Maximum number of old rotated log files to retain")
+	flag.IntVar(&cp.logMaxAge, "log-max-age", 30,
+		"Maximum number of days to retain old log files")
 }
 
 func main() {
 	cp := &cliParams{}
 	flagInit(cp)
 	flag.Parse()
+	if f := flag.Lookup("logtostderr"); f != nil && f.Value.String() != "true" {
+		flag.Set("logtostderr", "true") //nolint:errcheck
+	}
+	if f := flag.Lookup("alsologtostderr"); f != nil && f.Value.String() != "false" {
+		flag.Set("alsologtostderr", "false") //nolint:errcheck
+	}
+
+	if cleanupLog := setupLogRotation(cp); cleanupLog != nil {
+		defer cleanupLog()
+	}
+	defer glog.Flush()
+
 	rm := newResourceManager(cp)
 
 	glog.Infof("resource manager reading configs")
@@ -90,5 +111,55 @@ func main() {
 	}
 	if err := rm.cleanupCDISpecs(); err != nil {
 		glog.Errorf("cleaning up CDI Specs produced error: %s", err.Error())
+	}
+}
+
+// setupLogRotation configures stderr-based log rotation. It uses the
+// glog --log_dir path when set, otherwise falls back to the default
+// log directory. Returns a cleanup function that must be deferred.
+func setupLogRotation(cp *cliParams) func() {
+	logDir := logging.DefaultConfig().LogDir
+	if f := flag.Lookup("log_dir"); f != nil {
+		if v := f.Value.String(); v != "" {
+			logDir = v
+		}
+	}
+
+	rawCfg := logging.Config{
+		LogDir:     logDir,
+		MaxSizeMB:  cp.logMaxSize,
+		MaxFiles:   cp.logMaxFiles,
+		MaxAgeDays: cp.logMaxAge,
+		Compress:   true,
+	}
+	cfg, warnings, err := logging.ResolveConfig(rawCfg)
+	for _, w := range warnings {
+		glog.Warning(w)
+	}
+	if err != nil {
+		glog.Errorf("failed to resolve log rotation config: %v — continuing without rotation", err)
+		return nil
+	}
+
+	rotWriter, _, err := logging.NewRotatingWriter(cfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "sriovdp: log rotation disabled; cannot use log directory %q: %v\n", cfg.LogDir, err) //nolint:errcheck
+		glog.Errorf("failed to create log rotation writer: %v — continuing without rotation", err)
+		return nil
+	}
+
+	cleanup, err := logging.CaptureStderr(rotWriter)
+	if err != nil {
+		glog.Errorf("failed to capture stderr for log rotation: %v — continuing without rotation", err)
+		rotWriter.Close() //nolint:errcheck
+		return nil
+	}
+
+	glog.Infof("Log rotation enabled: dir=%s maxSize=%dMB maxFiles=%d maxAge=%d compress=%v",
+		cfg.LogDir, cfg.MaxSizeMB, cfg.MaxFiles, cfg.MaxAgeDays, cfg.Compress)
+
+	return func() {
+		cleanup()
+		rotWriter.Close() //nolint:errcheck
 	}
 }
